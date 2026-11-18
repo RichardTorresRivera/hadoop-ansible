@@ -1,0 +1,184 @@
+---
+- name: 1. Preparar sistema base, Java y usuario Hadoop en todos los nodos
+  hosts: hadoop_cluster
+  become: yes
+  tasks:
+    - name: Actualizar caché de paquetes e instalar dependencias y OpenJDK 11
+      apt:
+        name:
+          - openjdk-11-jdk
+          - wget
+          - curl
+          - ssh
+          - pdsh
+        state: present
+        update_cache: yes
+
+    - name: Asegurar /etc/hosts limpio con los nodos del clúster
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          192.168.56.10 hadoop-master
+          192.168.56.11 hadoop-worker1
+          192.168.56.12 hadoop-worker2
+          192.168.56.13 hadoop-worker3
+
+    - name: Crear grupo y usuario 'hadoop'
+      user:
+        name: "{{ hadoop_user }}"
+        shell: /bin/bash
+        create_home: yes
+
+    - name: Dar privilegios sudo sin contraseña al usuario 'hadoop'
+      copy:
+        dest: "/etc/sudoers.d/{{ hadoop_user }}"
+        content: "{{ hadoop_user }} ALL=(ALL) NOPASSWD:ALL\n"
+        mode: '0440'
+
+    - name: Descargar binario de Apache Hadoop {{ hadoop_version }}
+      get_url:
+        url: "https://archive.apache.org/dist/hadoop/common/hadoop-{{ hadoop_version }}/hadoop-{{ hadoop_version }}.tar.gz"
+        dest: "/tmp/hadoop-{{ hadoop_version }}.tar.gz"
+        mode: '0644'
+
+    - name: Extraer Apache Hadoop en /opt
+      unarchive:
+        src: "/tmp/hadoop-{{ hadoop_version }}.tar.gz"
+        dest: /opt/
+        remote_src: yes
+        creates: "/opt/hadoop-{{ hadoop_version }}"
+
+    - name: Crear enlace simbólico /opt/hadoop
+      file:
+        src: "/opt/hadoop-{{ hadoop_version }}"
+        dest: /opt/hadoop
+        state: link
+
+    - name: Crear directorios de datos HDFS (NameNode, DataNode y tmp)
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0755'
+      loop:
+        - /opt/hadoop/data/namenode
+        - /opt/hadoop/data/datanode
+        - /opt/hadoop/data/tmp
+
+    - name: Asignar propiedad de /opt/hadoop al usuario 'hadoop'
+      file:
+        path: "/opt/hadoop-{{ hadoop_version }}"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        recurse: yes
+
+- name: 2. Configurar SSH interno entre Master y Workers para el usuario 'hadoop'
+  hosts: master
+  become: yes
+  tasks:
+    - name: Asegurar directorio .ssh para el usuario 'hadoop'
+      file:
+        path: "/home/{{ hadoop_user }}/.ssh"
+        state: directory
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0700'
+
+    - name: Generar par de llaves SSH en hadoop-master
+      openssh_keypair:
+        path: "/home/{{ hadoop_user }}/.ssh/id_rsa"
+        type: rsa
+        size: 2048
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        force: no
+
+    - name: Leer la llave pública generada en hadoop-master
+      slurp:
+        src: "/home/{{ hadoop_user }}/.ssh/id_rsa.pub"
+      register: master_ssh_pub
+
+    - name: Guardar llave pública en hecho global
+      set_fact:
+        hadoop_pub_key: "{{ master_ssh_pub['content'] | b64decode }}"
+
+- name: Distribuir llave pública del master a todos los nodos
+  hosts: hadoop_cluster
+  become: yes
+  tasks:
+    - name: Autorizar llave SSH del master en el usuario 'hadoop'
+      authorized_key:
+        user: "{{ hadoop_user }}"
+        state: present
+        key: "{{ hostvars['hadoop-master']['hadoop_pub_key'] }}"
+
+    - name: Deshabilitar StrictHostKeyChecking para el usuario 'hadoop'
+      copy:
+        dest: "/home/{{ hadoop_user }}/.ssh/config"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0600'
+        content: |
+          Host *
+              StrictHostKeyChecking no
+              UserKnownHostsFile=/dev/null
+
+- name: 3. Aplicar configuración XML y variables de entorno de Hadoop
+  hosts: hadoop_cluster
+  become: yes
+  tasks:
+    - name: Detectar ruta dinámica de JAVA_HOME
+      shell: dirname $(dirname $(readlink -f $(which javac)))
+      register: java_home_path
+      changed_when: false
+
+    - name: Configurar JAVA_HOME en hadoop-env.sh
+      lineinfile:
+        path: /opt/hadoop/etc/hadoop/hadoop-env.sh
+        regexp: '^#?\s*export JAVA_HOME='
+        line: "export JAVA_HOME={{ java_home_path.stdout }}"
+
+    - name: Copiar plantillas XML y archivo workers
+      template:
+        src: "{{ item.src }}"
+        dest: "/opt/hadoop/etc/hadoop/{{ item.dest }}"
+        owner: "{{ hadoop_user }}"
+        group: "{{ hadoop_user }}"
+        mode: '0644'
+      loop:
+        - { src: 'core-site.xml.j2', dest: 'core-site.xml' }
+        - { src: 'hdfs-site.xml.j2', dest: 'hdfs-site.xml' }
+        - { src: 'mapred-site.xml.j2', dest: 'mapred-site.xml' }
+        - { src: 'yarn-site.xml.j2', dest: 'yarn-site.xml' }
+        - { src: 'workers.j2', dest: 'workers' }
+
+    - name: Configurar variables de entorno en .bashrc del usuario 'hadoop'
+      blockinfile:
+        path: "/home/{{ hadoop_user }}/.bashrc"
+        marker: "# {mark} HADOOP ENV VARS"
+        block: |
+          export JAVA_HOME={{ java_home_path.stdout }}
+          export HADOOP_HOME=/opt/hadoop
+          export HADOOP_INSTALL=$HADOOP_HOME
+          export HADOOP_MAPRED_HOME=$HADOOP_HOME
+          export HADOOP_COMMON_HOME=$HADOOP_HOME
+          export HADOOP_HDFS_HOME=$HADOOP_HOME
+          export YARN_HOME=$HADOOP_HOME
+          export HADOOP_COMMON_LIB_NATIVE_DIR=$HADOOP_HOME/lib/native
+          export PATH=$PATH:$HADOOP_HOME/sbin:$HADOOP_HOME/bin
+
+- name: 4. Formatear NameNode e iniciar el clúster Hadoop
+  hosts: master
+  become: yes
+  tasks:
+    - name: Formatear NameNode (solo si no existe carpeta current)
+      shell: su - {{ hadoop_user }} -c "/opt/hadoop/bin/hdfs namenode -format -force"
+      args:
+        creates: /opt/hadoop/data/namenode/current
+
+    - name: Iniciar servicios HDFS (start-dfs.sh)
+      shell: su - {{ hadoop_user }} -c "/opt/hadoop/sbin/start-dfs.sh"
+
+    - name: Iniciar servicios YARN (start-yarn.sh)
+      shell: su - {{ hadoop_user }} -c "/opt/hadoop/sbin/start-yarn.sh"

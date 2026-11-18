@@ -1,0 +1,5 @@
+192.168.56.10 hadoop-master
+192.168.56.11 hadoop-worker1
+192.168.56.12 hadoop-worker2
+192.168.56.13 hadoop-worker3
+
